@@ -1,32 +1,33 @@
 --[[
-  VAULT BRAIN - monitor interface (DEMO MODE)
+  VAULT UI - monitor interfaces (DEMO MODE)
   ---------------------------------------------------------------
-  CC:Tweaked program for a 7 wide x 5 tall Advanced Monitor.
-  At text scale 0.5 that monitor is 143 x 67 characters.
+  One program for three computers. It looks at the size of the
+  attached monitor and shows the matching screen:
 
-  Everything shown is SIMULATED (items, turtles, crafter, basins),
-  so you can see and use the interface before it is wired into
-  the real vault program.
+    7 wide x 5 tall  (143x67)  BRAIN    control: craft, jobs, machines
+    7 wide x 3 tall  (143x38)  STORAGE  items, search, withdraw
+    7 wide x 6 tall  (143x81)  FACTORY  gauge board of every production line
 
-  Setup:
-    1. Advanced Computer + the 7x5 Advanced Monitor (touching the
-       computer or connected with a wired modem).
-    2. Save this file on the computer as  brain_ui.lua
-    3. Run:  brain_ui
+  You can also force a screen:  vault_ui brain | storage | factory
 
-  Touch the monitor (right-click) to use it.
+  Everything shown is SIMULATED, so you can see and use the screens
+  before they are wired into the real vault engine.
+
   Keys on the computer:
     D drop items into input   F fail next turtle batch
     U unplug/replug silo_46   P palette   S speed
     R reset demo              Q quit
 ]]
 
+local ARGS = {...}
 local CONFIG = {
+  role      = nil,     -- "brain", "storage" or "factory"; nil = pick by monitor size
   monitor   = nil,     -- monitor peripheral name, nil = first one found
   textScale = 0.5,     -- 0.5 = 143x67 on a 7x5 monitor
   palette   = "brain", -- "brain" (custom colours) or "cc" (default colours)
   frame     = 0.15,    -- seconds between redraws
 }
+local ROLE = "brain"
 
 ---------------------------------------------------------------------
 -- Basics
@@ -40,6 +41,9 @@ for i = 0, 15 do HEXC[i] = ("0123456789abcdef"):sub(i + 1, i + 1) end
 local PALETTES = {
   brain = {0xE6EBF0,0xE38B3B,0xC878D2,0x72B4E6,0xE9C34B,0x88CE5E,0xE99CB2,0x2B3542,
            0x7E8B9C,0x4FB2AB,0x9B7DE1,0x1A212B,0x8E6B46,0x3F9157,0xE2574F,0x0D1117},
+  -- factory board: wood planks, gold frames, grey pipes (like Create factory gauges)
+  factory = {0xF3EBDA,0xE0873A,0xC772C9,0x7FB1E3,0xE2B44A,0x7CC659,0xE7A0B4,0x595D63,
+             0xA3A7AC,0x4BA8A3,0x2E1F13,0xC9A06A,0xB28854,0x3F8F4F,0xD9534A,0x3A2818},
 }
 local CH_R, CH_L, CH_U, CH_D, CH_DOT, CH_DIA, CH_CHK = "\16", "\17", "\30", "\31", "\7", "\4", "\127"
 
@@ -296,6 +300,7 @@ local STORAGE_DEFS = {
  {id="minecraft:chest_12",name="chest_12",role="REST",slots=27,mult=1},
 }
 local S
+local AUTOSTOCK = nil  -- set by the factory board
 
 local function freshState()
   local r = rng(1337)
@@ -347,6 +352,7 @@ local function freshState()
     cv={sel="create:shaft", qty=64, page=0, filter="ALL", search="", planPage=0, detail=false},
     mv={sub="t"}, fv={page=0}, kb={open=false, target=nil}, confirm={key=nil, until_=0},
     ready={}, readyAt=-9, tot={}, totN=0,
+    ftarget={}, keep={}, autoStock=true, autoStockAcc=0, fsel="create:andesite_alloy",
   }
 end
 
@@ -511,11 +517,11 @@ end
 ---------------------------------------------------------------------
 -- Simulation
 ---------------------------------------------------------------------
-local function queueCraft(item, qty)
+local function queueCraft(item, qty, stock)
   local r = RECIPES[item]
   local p = plan(item, qty)
   if not p.ok then toast("Missing " .. missingText(p), C.red) return false end
-  S.jobs[#S.jobs + 1] = {id=S.nextJobId, item=item, qty=qty, state="QUEUED", steps={}, started=0, err=nil, out=r.out}
+  S.jobs[#S.jobs + 1] = {id=S.nextJobId, item=item, qty=qty, state="QUEUED", steps={}, started=0, err=nil, out=r.out, stock=stock}
   S.nextJobId = S.nextJobId + 1
   log("PLAN", "Queued " .. iName(item) .. " x" .. qty .. (#S.jobs > 1 and (" (position " .. #S.jobs .. ")") or ""))
   toast(((#S.jobs > 1) and "Queued " or "Crafting ") .. iName(item) .. " x" .. qty, C.yellow)
@@ -530,6 +536,14 @@ local function pushHistory(rec)
   while #S.history > 12 do table.remove(S.history) end
 end
 local function finishJob(job)
+  if job.stock then
+    job.state = "DONE"; S.craftedToday = S.craftedToday + job.qty
+    log("CRAFT", "Stocked " .. iName(job.item) .. " x" .. job.qty .. " (kept in storage)")
+    toast("Stocked: " .. iName(job.item) .. " x" .. job.qty, C.lime)
+    pushHistory({item=job.item, qty=job.qty, ok=true, secs=S.t - job.started, msg="Stocked"})
+    table.remove(S.jobs, 1)
+    return
+  end
   local got = removeStock(job.item, job.qty)
   S.output[job.item] = (S.output[job.item] or 0) + got; S.outputAt = S.t
   job.state = "DONE"; S.craftedToday = S.craftedToday + job.qty; moved(got)
@@ -793,6 +807,8 @@ local function simWorld(dt)
       log("DEFRAG", "Defrag done: freed " .. d.freed .. " slots"); toast("Defrag freed " .. d.freed .. " slots", C.magenta)
     end
   end
+  -- factory auto-stock (only on the factory screen)
+  if ROLE == "factory" and AUTOSTOCK then AUTOSTOCK(dt) end
   -- throughput history (one bucket per sim second)
   S.sec = S.sec + dt
   if S.sec >= 1 then
@@ -1093,18 +1109,20 @@ local function drawTabs(y)
     x = x + ww
   end
 end
-local function drawStatus()
+local function drawStatus(kinds, bg)
   local y = H - 1
-  B.fill(0, y, W, 1, C.gray)
-  local l = S.log[#S.log]
+  bg = bg or C.gray
+  B.fill(0, y, W, 1, bg)
+  local l
+  for i = #S.log, 1, -1 do if not kinds or kinds[S.log[i].kind] then l = S.log[i] break end end
   local t = S.touchInfo and ("touch " .. S.touchInfo.x .. "," .. S.touchInfo.y) or "tap anywhere"
   if l then
-    B.text(1, y, clockStr(l.tod), C.lightGray, C.gray)
+    B.text(1, y, clockStr(l.tod), C.lightGray, bg)
     local tag = " " .. l.kind .. " "
     B.text(7, y, tag, C.black, LOGCOL[l.kind] or C.white)
-    B.text(8 + #tag, y, trunc(l.text, W - 10 - #tag - #t - 2), C.white, C.gray)
+    B.text(8 + #tag, y, trunc(l.text, W - 10 - #tag - #t - 2), C.white, bg)
   end
-  B.text(W - #t - 1, y, t, C.lightGray, C.gray)
+  B.text(W - #t - 1, y, t, C.lightGray, bg)
 end
 local function drawToasts()
   local now = rt()
@@ -1124,7 +1142,7 @@ local function drawToasts()
 end
 local function drawKeyboard()
   local wide = W >= 110
-  local kw, kh, gap = wide and 8 or 6, wide and 3 or 2, 1
+  local kw, kh, gap = wide and 8 or 6, (wide and H >= 50) and 3 or 2, 1
   local rows = {"1234567890", "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"}
   local bw = 10 * (kw + gap) + 1
   local bh = #rows * (kh + gap) + kh + gap + 4
@@ -1460,7 +1478,10 @@ itemDetail = function(x, y, w, h, wide)
       {disabled=have(id) <= 0, on=function() withdraw(id, amount) end})
   end
   yy = yy + 4
-  if RECIPES[id] then
+  if RECIPES[id] and ROLE ~= "brain" then
+    B.text(x + 1, yy, trunc("Recipe known - craft it from the Brain monitor", w - 2), C.lime, C.blue)
+    yy = yy + 2
+  elseif RECIPES[id] then
     button("it:craft", x + 1, yy, w - 2, 3, "CRAFT MORE " .. CH_R, {bg=C.yellow, fg=C.black, on=function()
       S.cv.sel = id; S.cv.detail = true; S.cv.qty = min(64, S.cv.qty); S.cv.planPage = 0; go("craft") end})
     yy = yy + 4
@@ -2016,7 +2037,7 @@ end
 
 local SCREENS = {home=scrHome, items=scrItems, craft=scrCraft, jobs=scrJobs, mach=scrMach, store=scrStore, farms=scrFarms}
 
-local function frame()
+local function brainFrame()
   UI.regions = {}
   B.clear(C.black)
   local wide = W >= 110
@@ -2032,12 +2053,469 @@ local function frame()
 end
 
 ---------------------------------------------------------------------
+-- STORAGE screen (7 wide x 3 tall = 143x38)
+---------------------------------------------------------------------
+local function storageFrame()
+  UI.regions = {}
+  B.clear(C.black)
+  local cap, u = 0, 0
+  for _, s in ipairs(mainStorages()) do cap = cap + s.cap; u = u + used(s) end
+  B.fill(0, 0, W, 1, C.gray)
+  B.text(0, 0, " VAULT STORAGE ", C.black, C.yellow)
+  B.text(16, 0, kfmt(totalItems()) .. " items   " .. S.totN .. " types   MAIN " .. round(u / max(1, cap) * 100) .. "% full", C.white, C.gray)
+  local inN, outN = 0, 0
+  for _, s in ipairs(S.input) do inN = inN + s.n end
+  for _, v in pairs(S.output) do outN = outN + v end
+  local right = ("input %s   output %s   Day %d %s "):format(kfmt(inN), kfmt(outN), S.day, clockStr())
+  B.text(W - #right, 0, right, C.lightGray, C.gray)
+  -- one tile per storage: name, fill %, bar
+  local n = #S.storages
+  local cw = floor((W - 1) / n)
+  for i, s in ipairs(S.storages) do
+    local x = 1 + (i - 1) * cw
+    local f = used(s) / s.cap
+    B.fill(x, 1, cw - 1, 2, C.blue)
+    B.text(x + 1, 1, trunc(s.name, cw - 7), s.online and (s.role == "MAIN" and C.white or C.lightBlue) or C.red, C.blue)
+    if s.online then
+      local pct = round(f * 100) .. "%"
+      B.text(x + cw - 2 - #pct, 1, pct, C.lightGray, C.blue)
+      bar(x + 1, 2, cw - 3, f, (f > 0.85 and C.red) or (f > 0.6 and C.orange) or (s.role == "MAIN" and C.yellow or C.lightBlue), C.gray, true)
+    else
+      B.text(x + 1, 2, trunc(" OFFLINE ", cw - 3), C.white, C.red)
+    end
+  end
+  scrItems(1, 4, W - 2, H - 5, W >= 110)
+  drawStatus({INPUT=true, OUTPUT=true, AUTO=true, SYSTEM=true, ERROR=true})
+  if S.kb.open then drawKeyboard() end
+  drawToasts()
+end
+
+---------------------------------------------------------------------
+-- FACTORY GAUGE BOARD (7 wide x 6 tall = 143x81)
+-- Each panel is one production line. Inputs sit on the top row,
+-- products below them; grey pipes show which items feed which.
+---------------------------------------------------------------------
+local F = {}
+F.PANELS = {
+  {title="Wood", outputs={"minecraft:oak_planks","minecraft:oak_slab","minecraft:stick","minecraft:crafting_table",
+                          "minecraft:chest","minecraft:barrel","minecraft:torch"}},
+  {title="Andesite", outputs={"minecraft:iron_nugget","create:andesite_alloy","create:shaft","create:cogwheel",
+                              "create:large_cogwheel","create:basin","create:hand_crank","create:depot","create:mechanical_drill"}},
+  {title="Iron", outputs={"minecraft:iron_block","minecraft:iron_bars","minecraft:hopper","create:propeller",
+                          "create:encased_fan","create:mechanical_press","create:item_vault","create:whisk"}},
+  {title="Blasters A", outputs={"minecraft:stone","minecraft:smooth_stone","minecraft:glass","minecraft:glass_pane","minecraft:brick"}},
+  {title="Redstone", outputs={"minecraft:redstone_torch","minecraft:piston"}},
+  {title="Crafter 21 A", outputs={"create:crushing_wheel"}},
+  {title="Missing machines", external=true,
+   outputs={"create:iron_sheet","create:copper_sheet","create:andesite_casing","create:brass_casing"}},
+}
+F.EXT = {
+  ["create:iron_sheet"]={"minecraft:iron_ingot"}, ["create:copper_sheet"]={"minecraft:copper_ingot"},
+  ["create:andesite_casing"]={"create:andesite_alloy","minecraft:oak_log"},
+  ["create:brass_casing"]={"create:brass_ingot","minecraft:oak_log"},
+}
+F.TARGETS = {
+  ["minecraft:oak_planks"]=512, ["minecraft:oak_slab"]=64, ["minecraft:stick"]=256, ["minecraft:crafting_table"]=8,
+  ["minecraft:chest"]=32, ["minecraft:barrel"]=16, ["minecraft:torch"]=128, ["minecraft:iron_nugget"]=256,
+  ["create:andesite_alloy"]=512, ["create:shaft"]=128, ["create:cogwheel"]=64, ["create:large_cogwheel"]=32,
+  ["create:basin"]=8, ["create:hand_crank"]=4, ["create:depot"]=8, ["create:mechanical_drill"]=4,
+  ["minecraft:iron_block"]=32, ["minecraft:iron_bars"]=64, ["minecraft:hopper"]=8, ["create:propeller"]=8,
+  ["create:encased_fan"]=16, ["create:mechanical_press"]=4, ["create:item_vault"]=16, ["create:whisk"]=4,
+  ["minecraft:stone"]=2000, ["minecraft:smooth_stone"]=512, ["minecraft:glass"]=1000, ["minecraft:glass_pane"]=128,
+  ["minecraft:brick"]=256, ["minecraft:redstone_torch"]=32, ["minecraft:piston"]=16, ["create:crushing_wheel"]=4,
+}
+F.GW, F.GH, F.GX, F.LH = 6, 3, 7, 5
+F.DARK = {[C.white]=true,[C.orange]=true,[C.magenta]=true,[C.lightBlue]=true,[C.yellow]=true,[C.lime]=true,
+          [C.pink]=true,[C.lightGray]=true,[C.cyan]=true,[C.blue]=true,[C.brown]=true}
+F.layout = nil
+function F.ing(id)
+  local tg = TAGS[id]
+  if not tg then return id end
+  for _, m in ipairs(tg.members) do if RECIPES[m] then return m end end
+  return tg.members[1]
+end
+function F.inputs(id, external)
+  if external then return F.EXT[id] or {} end
+  local r = RECIPES[id]
+  if not r then return {} end
+  local out, seen = {}, {}
+  for _, ing in ipairs(ingredients(r)) do
+    local m = F.ing(ing[1])
+    if not seen[m] then seen[m] = true; out[#out + 1] = m end
+  end
+  return out
+end
+function F.target(id) return S.ftarget[id] or F.TARGETS[id] or (ITEMS[id] and ITEMS[id].target) or 0 end
+function F.statusCol(f)
+  if f >= 1 then return C.lime elseif f >= 0.5 then return C.yellow elseif f >= 0.2 then return C.orange end
+  return C.red
+end
+function F.build(width)
+  local panels, px, py, rowH = {}, 1, 2, 0
+  for _, pd in ipairs(F.PANELS) do
+    local isOut, nodes, order = {}, {}, {}
+    for _, id in ipairs(pd.outputs) do isOut[id] = true end
+    local function add(id)
+      if not nodes[id] then nodes[id] = {id=id, isOut=isOut[id] == true, external=pd.external}; order[#order + 1] = id end
+    end
+    for _, id in ipairs(pd.outputs) do for _, ing in ipairs(F.inputs(id, pd.external)) do add(ing) end end
+    for _, id in ipairs(pd.outputs) do add(id) end
+    local function layerOf(id, depth)
+      local nd = nodes[id]
+      if nd.layer then return nd.layer end
+      if not nd.isOut or depth > 12 then nd.layer = 0 return 0 end
+      local L = 0
+      for _, ing in ipairs(F.inputs(id, pd.external)) do
+        if nodes[ing] and ing ~= id then L = max(L, layerOf(ing, depth + 1) + 1) end
+      end
+      nd.layer = max(1, L)
+      return nd.layer
+    end
+    local layers, maxL = {}, 0
+    for _, id in ipairs(order) do
+      local L = layerOf(id, 0)
+      layers[L] = layers[L] or {}
+      layers[L][#layers[L] + 1] = nodes[id]
+      if L > maxL then maxL = L end
+    end
+    for L = 0, maxL do layers[L] = layers[L] or {} end
+    local edges = {}
+    for _, id in ipairs(order) do
+      if nodes[id].isOut then
+        for _, ing in ipairs(F.inputs(id, pd.external)) do
+          if nodes[ing] and ing ~= id then edges[#edges + 1] = {from=nodes[ing], to=nodes[id]} end
+        end
+      end
+    end
+    -- order each row by the average position of connected items (fewer crossing pipes)
+    local function setIdx(L) for i, nd in ipairs(layers[L]) do nd.idx = i / (#layers[L] + 1) end end
+    for L = 0, maxL do setIdx(L) end
+    local function bary(nd, up)
+      local s, c = 0, 0
+      for _, e in ipairs(edges) do
+        if up and e.to == nd then s = s + e.from.idx; c = c + 1
+        elseif not up and e.from == nd then s = s + e.to.idx; c = c + 1 end
+      end
+      return c > 0 and s / c or nd.idx
+    end
+    local function sortLayer(L, up)
+      local ly = layers[L]
+      for _, nd in ipairs(ly) do nd.b = bary(nd, up) end
+      table.sort(ly, function(a, b) if a.b ~= b.b then return a.b < b.b end return a.id < b.id end)
+      setIdx(L)
+    end
+    for _ = 1, 2 do
+      for L = 1, maxL do sortLayer(L, true) end
+      sortLayer(0, false)
+    end
+    local maxCount = 1
+    for L = 0, maxL do if #layers[L] > maxCount then maxCount = #layers[L] end end
+    local w = max(#pd.title + 8, maxCount * F.GX + 3)
+    local h = (maxL + 1) * F.LH + 1
+    if px > 1 and px + w > width - 1 then px = 1; py = py + rowH + 1; rowH = 0 end
+    local p = {title=pd.title, external=pd.external, x=px, y=py, w=w, h=h, order=order, nodes=nodes, edges=edges, layers=layers, maxL=maxL}
+    for L = 0, maxL do
+      local ly = layers[L]
+      local off = floor((maxCount - #ly) * F.GX / 2)
+      for i, nd in ipairs(ly) do nd.gx = px + 2 + off + (i - 1) * F.GX; nd.gy = py + 2 + L * F.LH end
+    end
+    panels[#panels + 1] = p
+    px = px + w + 1
+    if h > rowH then rowH = h end
+  end
+  -- every product shown on the board, in board order (used by auto-stock and the summary)
+  local products, seen, consumers = {}, {}, {}
+  for _, p in ipairs(panels) do
+    for _, id in ipairs(p.order) do
+      if p.nodes[id].isOut and not p.external and not seen[id] then seen[id] = true; products[#products + 1] = id end
+    end
+    for _, e in ipairs(p.edges) do
+      consumers[e.from.id] = consumers[e.from.id] or {}
+      local list = consumers[e.from.id]
+      if not contains(list, e.to.id) then list[#list + 1] = e.to.id end
+    end
+  end
+  return {panels=panels, bottom=py + rowH, width=width, products=products, consumers=consumers}
+end
+function F.activeItem()
+  local j = S.jobs[1]
+  if not j or j.state ~= "RUNNING" then return nil end
+  for _, s in ipairs(j.steps) do if s.done < s.crafts then return s.item end end
+  return nil
+end
+-- wooden plate with a gold border, like the panels on a Create factory board
+function F.plate(x, y, w, h, title, meta)
+  B.fill(x, y, w, h, C.yellow)
+  for yy = y + 1, y + h - 2 do B.fill(x + 1, yy, w - 2, 1, ((yy - y) % 3 == 0) and C.brown or C.blue) end
+  if title then B.text(x + 2, y, " " .. title:upper() .. " ", C.white, C.black) end
+  if meta then
+    local m = " " .. trunc(meta, max(1, w - #title - 10)) .. " "
+    B.text(x + w - 2 - #m, y, m, C.black, C.yellow)
+  end
+end
+function F.drawGauge(nd, active)
+  local x, y, id = nd.gx, nd.gy, nd.id
+  local GW = F.GW
+  local blink = floor(rt() * 4) % 2 == 0
+  local frame = C.yellow
+  if nd.external and nd.isOut then frame = C.red end
+  if active == id then frame = blink and C.orange or C.white end
+  if S.fsel == id then frame = C.white end
+  local sh = iSh(id)
+  B.fill(x, y, GW, 1, frame)
+  B.text(x + floor((GW - #sh) / 2), y, sh, (frame == C.red) and C.white or C.black, frame)
+  local col = iCol(id)
+  B.fill(x, y + 1, GW, 1, col)
+  local n = have(id)
+  local cs = (n < 10000) and fmt(n) or kfmt(n)
+  B.text(x + floor((GW - #cs) / 2), y + 1, trunc(cs, GW), F.DARK[col] and C.black or C.white, col)
+  local tg = F.target(id)
+  if tg > 0 then bar(x, y + 2, GW, n / tg, F.statusCol(n / tg), C.black)
+  else B.fill(x, y + 2, GW, 1, C.gray) end
+  if nd.isOut and not nd.external and S.keep[id] ~= false then B.put(x + GW - 1, y + 2, "\7", C.white, nil) end
+  region("g:" .. id .. ":" .. x .. ":" .. y, x, y, GW, F.GH, function() S.fsel = id end)
+end
+function F.drawPanel(p, active)
+  local stocked, total = 0, 0
+  for _, id in ipairs(p.order) do
+    if p.nodes[id].isOut then
+      total = total + 1
+      local tg = F.target(id)
+      if tg > 0 and have(id) >= tg then stocked = stocked + 1 end
+    end
+  end
+  F.plate(p.x, p.y, p.w, p.h, p.title, p.external and "no machine" or (stocked .. "/" .. total))
+  -- pipes: each cell remembers which directions it connects (up/down/left/right)
+  local cells = {}
+  local function mark(x, y, u, d, l, r, pri)
+    local k = y * 1000 + x
+    local c = cells[k]
+    if not c then c = {x=x, y=y, pri=0}; cells[k] = c end
+    c.u = c.u or u; c.d = c.d or d; c.l = c.l or l; c.r = c.r or r
+    if pri > c.pri then c.pri = pri end
+  end
+  local function seg(x0, y0, x1, y1, pri)
+    if x0 == x1 then
+      local a, b = min(y0, y1), max(y0, y1)
+      for y = a, b do mark(x0, y, y > a, y < b, false, false, pri) end
+    else
+      local a, b = min(x0, x1), max(x0, x1)
+      for x = a, b do mark(x, y0, false, false, x > a, x < b, pri) end
+    end
+  end
+  for _, e in ipairs(p.edges) do
+    local pri = (p.external and 2) or ((e.to.id == active) and 3) or 1
+    local sx, sy = e.from.gx + 2, e.from.gy + F.GH
+    local tx, by = e.to.gx + 2, e.to.gy - 1
+    if by >= sy then
+      seg(sx, sy, sx, by, pri); seg(sx, by, tx, by, pri)
+      mark(sx, sy, true, false, false, false, pri)
+      mark(tx, by, false, true, false, false, pri)
+    end
+  end
+  local phase = floor(rt() * 6)
+  for _, c in pairs(cells) do
+    local ch = tele(c.u, false, c.u or c.d or c.l or c.r, c.r, c.d, false)
+    local col = C.gray
+    if c.pri == 2 then col = C.red
+    elseif c.pri == 3 then col = ((c.x + c.y + phase) % 3 == 0) and C.white or C.orange end
+    B.put(c.x, c.y, ch, col, nil)
+  end
+  for _, id in ipairs(p.order) do F.drawGauge(p.nodes[id], active) end
+end
+function F.summary()
+  local total, stocked, low, missing = 0, 0, 0, 0
+  local seen = {}
+  for _, p in ipairs(F.layout.panels) do
+    for _, id in ipairs(p.order) do
+      local nd = p.nodes[id]
+      if not seen[id] then
+        seen[id] = true; total = total + 1
+        if nd.external and nd.isOut then missing = missing + 1
+        else
+          local tg = F.target(id)
+          if tg > 0 then if have(id) >= tg then stocked = stocked + 1 else low = low + 1 end end
+        end
+      end
+    end
+  end
+  return total, stocked, low, missing
+end
+function F.detail(x, y, w, h)
+  local id = S.fsel
+  F.plate(x, y, w, h, "Gauge", iName(id))
+  local tg = F.target(id)
+  local n = have(id)
+  local yy = y + 2
+  B.text(x + 2, yy, trunc(iName(id), w - 4), C.black, nil)
+  B.text(x + 2, yy + 1, trunc(id, w - 4), C.gray, nil)
+  yy = yy + 3
+  local cw = bigText(x + 2, yy, fmt(n), C.black, C.blue)
+  B.text(x + 4 + cw, yy + 1, tg > 0 and ("/ " .. fmt(tg) .. " target") or "no target set", C.gray, nil)
+  yy = yy + 3
+  local f = tg > 0 and n / tg or 0
+  if tg > 0 then bar(x + 2, yy, w - 4, f, F.statusCol(f), C.black) end
+  yy = yy + 2
+  local r = RECIPES[id]
+  local status, scol
+  if EXTERNAL[id] then status, scol = "NO MACHINE: " .. EXTERNAL[id], C.red
+  elseif not r then status, scol = "RAW: comes from a farm or the world", C.gray
+  elseif tg <= 0 then status, scol = "No target - not kept in stock", C.gray
+  elseif n >= tg then status, scol = "STOCKED", C.green
+  else status, scol = "BELOW TARGET: needs " .. fmt(tg - n), C.red end
+  B.text(x + 2, yy, trunc(status, w - 4), scol, nil); yy = yy + 2
+  if r then
+    local parts = {}
+    for _, ing in ipairs(ingredients(r)) do parts[#parts + 1] = ing[2] .. "x " .. iName(ing[1]) end
+    B.text(x + 2, yy, "MADE BY", C.gray, nil); B.text(x + 11, yy, trunc(MACH[r.m].name .. ", makes " .. r.out, w - 13), C.black, nil); yy = yy + 1
+    B.text(x + 2, yy, "FROM", C.gray, nil); B.text(x + 11, yy, trunc(table.concat(parts, ", "), w - 13), C.black, nil); yy = yy + 1
+  end
+  local cons = F.layout.consumers[id] or {}
+  if #cons > 0 then
+    local names = {}
+    for _, c in ipairs(cons) do names[#names + 1] = iName(c) end
+    B.text(x + 2, yy, "FEEDS", C.gray, nil); B.text(x + 11, yy, trunc(table.concat(names, ", "), w - 13), C.black, nil)
+  end
+  -- buttons
+  local by = y + h - 4
+  local bw = floor((w - 4 - 4) / 5)
+  local step = (tg >= 1000 and 500) or (tg >= 200 and 64) or (tg >= 32 and 16) or 4
+  local canMake = r ~= nil
+  button("f:make16", x + 2, by, bw, 3, "MAKE +16", {bg=C.black, disabled=not canMake, dbg=C.brown, on=function() queueCraft(id, 16, true) end})
+  button("f:make64", x + 3 + bw, by, bw, 3, "MAKE +64", {bg=C.black, disabled=not canMake, dbg=C.brown, on=function() queueCraft(id, 64, true) end})
+  button("f:tminus", x + 4 + 2 * bw, by, bw, 3, "TARGET -", {bg=C.gray, on=function() S.ftarget[id] = max(0, tg - step) end})
+  button("f:tplus", x + 5 + 3 * bw, by, bw, 3, "TARGET +", {bg=C.gray, on=function() S.ftarget[id] = tg + step end})
+  local keep = S.keep[id] ~= false
+  button("f:keep", x + 6 + 4 * bw, by, w - 8 - 4 * bw, 3, keep and "KEEP: ON" or "KEEP: OFF",
+    {bg=keep and C.green or C.gray, disabled=not canMake, dbg=C.brown, on=function() S.keep[id] = not keep end})
+end
+function F.production(x, y, w, h)
+  F.plate(x, y, w, h, "Production", S.autoStock and "auto-stock on" or "auto-stock off")
+  local yy = y + 2
+  local j = S.jobs[1]
+  if j then
+    B.text(x + 2, yy, trunc(iName(j.item) .. " x" .. j.qty .. (j.stock and "  (stock)" or "  (output)"), w - 4), C.black, nil)
+    yy = yy + 1
+    bar(x + 2, yy, w - 4, jobProgress(j), j.state == "FAILED" and C.red or C.green, C.black); yy = yy + 1
+    local st, si
+    for i, s in ipairs(j.steps) do if s.done < s.crafts then st, si = s, i break end end
+    local line = (j.state == "FAILED") and ("FAILED: " .. (j.err or "")) or (st and ("Step " .. si .. "/" .. #j.steps .. ": " .. iName(st.item) .. " on " .. MACH[st.m].name) or "Finishing")
+    B.text(x + 2, yy, trunc(line, w - 4), j.state == "FAILED" and C.red or C.gray, nil)
+  else
+    B.text(x + 2, yy, "Idle - every kept gauge is stocked or waiting.", C.gray, nil)
+  end
+  yy = yy + 2
+  B.text(x + 2, yy, "TURTLES", C.gray, nil); yy = yy + 1
+  for i, t in ipairs(S.turtles) do
+    local col = (t.state == "ERROR") and C.red or ((t.state == "IDLE") and C.green or C.cyan)
+    B.text(x + 2 + (i - 1) * 7, yy, " T" .. (i - 1) .. "   ", F.DARK[col] and C.black or C.white, col)
+    B.text(x + 2 + (i - 1) * 7, yy + 1, padR(t.state == "IDLE" and "idle" or t.state:lower(), 6), C.black, nil)
+  end
+  yy = yy + 3
+  local c = S.c21
+  B.text(x + 2, yy, "CRAFTER 21", C.gray, nil)
+  B.text(x + 14, yy, " " .. padR(c.state, 9) .. " ", C.white, c.state == "IDLE" and C.green or C.magenta)
+  yy = yy + 1
+  B.text(x + 2, yy, "BLASTERS", C.gray, nil)
+  for i, b in ipairs(S.basins) do
+    local hot = b.item and ((b.heat > 0.6 and C.yellow) or (b.heat > 0.2 and C.orange) or C.red) or C.black
+    B.put(x + 14 + (i - 1) * 2, yy, " ", nil, hot)
+  end
+  yy = yy + 2
+  B.text(x + 2, yy, "QUEUE", C.gray, nil); yy = yy + 1
+  if #S.jobs <= 1 then B.text(x + 2, yy, "empty", C.gray, nil) end
+  for i = 2, min(#S.jobs, 5) do
+    B.text(x + 2, yy, trunc((i - 1) .. ". " .. iName(S.jobs[i].item) .. " x" .. S.jobs[i].qty, w - 4), C.black, nil); yy = yy + 1
+  end
+  button("f:auto", x + 2, y + h - 4, w - 4, 3, S.autoStock and "AUTO-STOCK: ON" or "AUTO-STOCK: OFF",
+    {bg=S.autoStock and C.green or C.gray, on=function() S.autoStock = not S.autoStock; toast("Auto-stock " .. (S.autoStock and "on" or "off"), C.lime) end})
+end
+function F.legend(x, y, w, h)
+  F.plate(x, y, w, h, "How to read")
+  local sample = {id="create:shaft", gx=x + 3, gy=y + 2, isOut=true}
+  local saveSel = S.fsel; S.fsel = nil
+  F.drawGauge(sample, nil)
+  UI.regions[#UI.regions] = nil
+  S.fsel = saveSel
+  B.text(x + 11, y + 2, "item", C.black, nil)
+  B.text(x + 11, y + 3, "amount stored", C.black, nil)
+  B.text(x + 11, y + 4, "stock vs target", C.black, nil)
+  local rows = {
+    {C.lime, "at or above target"}, {C.yellow, "below target"}, {C.orange, "low"}, {C.red, "critical"},
+    {C.white, "white frame: selected"}, {C.red, "red frame: no machine yet"},
+    {C.orange, "orange pipe: crafting now"}, {C.gray, "grey pipe: recipe link"},
+  }
+  local yy = y + 7
+  for _, r in ipairs(rows) do
+    if yy >= y + h - 1 then break end
+    B.fill(x + 2, yy, 2, 1, r[1]); B.text(x + 5, yy, trunc(r[2], w - 7), C.black, nil); yy = yy + 1
+  end
+  if yy + 2 < y + h then
+    B.put(x + 2, yy + 1, "\7", C.white, C.black)
+    B.text(x + 5, yy + 1, trunc("dot: kept in stock", w - 7), C.black, nil)
+  end
+end
+function F.frame()
+  UI.regions = {}
+  if not F.layout or F.layout.width ~= W then F.layout = F.build(W) end
+  B.clear(C.black)
+  for y = 1, H - 2 do if y % 4 == 0 then B.fill(0, y, W, 1, C.purple) end end
+  -- header
+  B.fill(0, 0, W, 1, C.black)
+  B.text(0, 0, " FACTORY ", C.black, C.yellow)
+  local total, stocked, low, missing = F.summary()
+  B.text(11, 0, ("%d gauges   %d stocked   %d below target   %d need a machine"):format(total, stocked, low, missing), C.white, C.black)
+  local right = ("Day %d %s "):format(S.day, clockStr())
+  B.text(W - #right, 0, right, C.lightGray, C.black)
+  local active = F.activeItem()
+  if active then
+    local s = " CRAFTING " .. iName(active):upper() .. " "
+    B.text(W - #right - #s - 2, 0, s, C.black, C.orange)
+  end
+  for _, p in ipairs(F.layout.panels) do F.drawPanel(p, active) end
+  -- info row under the board
+  local iy = F.layout.bottom + 1
+  local ih = H - 1 - iy
+  if ih >= 12 then
+    local dw = floor((W - 4) * 0.42)
+    local pw = floor((W - 4) * 0.33)
+    F.detail(1, iy, dw, ih)
+    F.production(2 + dw, iy, pw, ih)
+    F.legend(3 + dw + pw, iy, W - 4 - dw - pw, ih)
+  end
+  drawStatus({PLAN=true, CRAFT=true, TURTLE=true, C21=true, BLAST=true, ERROR=true, OUTPUT=true}, C.black)
+  drawToasts()
+end
+-- Keep-stocked gauges: when one drops below target, queue a craft that stays in storage.
+AUTOSTOCK = function(dt)
+  if not S.autoStock or #S.jobs > 0 or not F.layout then return end
+  S.autoStockAcc = S.autoStockAcc + dt
+  if S.autoStockAcc < 6 then return end
+  S.autoStockAcc = 0
+  for _, id in ipairs(F.layout.products) do
+    if S.keep[id] ~= false and RECIPES[id] then
+      local tg, n = F.target(id), have(id)
+      if tg > 0 and n < tg then
+        local q = min(tg - n, 128)
+        if plan(id, q).ok then
+          log("PLAN", "Auto-stock: " .. iName(id) .. " " .. n .. "/" .. tg .. ", crafting " .. q)
+          queueCraft(id, q, true)
+          return
+        end
+      end
+    end
+  end
+end
+
+---------------------------------------------------------------------
 -- Monitor setup, input, main loop
 ---------------------------------------------------------------------
+local FRAMES = {brain=brainFrame, storage=storageFrame, factory=F.frame}
 local function applyPalette()
+  local pal = (ROLE == "factory") and PALETTES.factory or PALETTES.brain
   for i = 0, 15 do
     local c = 2 ^ i
-    if S.palette == "brain" then mon.setPaletteColour(c, PALETTES.brain[i + 1])
+    if S.palette == "brain" then mon.setPaletteColour(c, pal[i + 1])
     else mon.setPaletteColour(c, term.nativePaletteColour(c)) end
   end
   prevRows = {}
@@ -2050,13 +2528,19 @@ end
 local function setupMonitor()
   if CONFIG.monitor then mon = peripheral.wrap(CONFIG.monitor); monName = CONFIG.monitor
   else mon = peripheral.find("monitor"); monName = mon and peripheral.getName(mon) end
-  if not mon then error("No monitor found. Attach the 7x5 advanced monitor.", 0) end
+  if not mon then error("No monitor found. Attach the advanced monitor.", 0) end
   if not mon.isColour() then error("This needs an ADVANCED (gold) monitor.", 0) end
   mon.setTextScale(CONFIG.textScale)
   local w, h = mon.getSize()
+  local want = ARGS[1] or CONFIG.role
+  if want == "brain" or want == "storage" or want == "factory" then ROLE = want
+  elseif h >= 75 then ROLE = "factory"
+  elseif h <= 45 then ROLE = "storage"
+  else ROLE = "brain" end
   B.resize(w, h)
 end
 local function refreshReady()
+  if ROLE ~= "brain" then return end
   if S.t - S.readyAt < 1 then return end
   S.readyAt = S.t
   for _, id in ipairs(RECIPE_IDS) do S.ready[id] = plan(id, 1).ok end
@@ -2066,7 +2550,7 @@ local function reset()
   S = freshState()
   S.palette, S.speed = keepPal, keepSpeed
   recount()
-  log("SYSTEM", "Vault Brain started. 8 storages, 6 turtles, Crafter 21 A, Blasters A")
+  log("SYSTEM", "Vault " .. ROLE .. " screen started. 8 storages, 6 turtles, Crafter 21 A, Blasters A")
   log("SYSTEM", "Multiplier sync: 8 storages checked, 1 boosted (backpack_3 x16)")
   log("INPUT", "Oak Log x64 > silo_46")
   log("AUTO", "Cobblestone x64 chest_12 > silo_45")
@@ -2080,7 +2564,7 @@ local function hit(x, y)
 end
 local function drawTerminal()
   term.setBackgroundColour(colours.black); term.clear()
-  term.setCursorPos(1, 1); term.setTextColour(colours.yellow); print("VAULT BRAIN - monitor demo")
+  term.setCursorPos(1, 1); term.setTextColour(colours.yellow); print("VAULT UI - " .. ROLE:upper() .. " screen (demo)")
   term.setTextColour(colours.lightGrey)
   print(("Monitor: %s  %dx%d chars"):format(monName or "?", W, H))
   print(("Palette: %s   Speed: %dx"):format(S.palette, S.speed))
@@ -2092,7 +2576,7 @@ local function drawTerminal()
   print("D  drop items into input barrel")
   print("F  fail the next turtle batch")
   print("U  unplug / replug silo_46")
-  print("P  switch palette (brain / cc)")
+  print("P  switch palette")
   print("S  change speed (1x / 3x / 8x)")
   print("R  reset demo")
   print("Q  quit")
@@ -2101,7 +2585,7 @@ local function drawTerminal()
     print(("last touch %d,%d -> %s"):format(S.touchInfo.x, S.touchInfo.y, S.touchInfo.key or "nothing"))
   end
 end
-local function render() frame(); B.flush() end
+local function render() FRAMES[ROLE](); B.flush() end
 
 local function onKey(k)
   if k == keys.d then
@@ -2112,7 +2596,7 @@ local function onKey(k)
     toast("Stacks dropped into barrel_73", C.lightBlue)
   elseif k == keys.f then
     S.failNext = true; toast("Next turtle batch will time out", C.red)
-    if #S.jobs == 0 then queueCraft("create:shaft", 128); go("jobs") end
+    if #S.jobs == 0 then queueCraft("create:shaft", 128, ROLE == "factory"); go("jobs") end
   elseif k == keys.u then
     local s = S.storages[4]; s.online = not s.online; recount()
     log(s.online and "SYSTEM" or "ERROR", s.name .. (s.online and " reconnected" or " disconnected - peripheral detached"))
@@ -2176,4 +2660,4 @@ end
 local ok, err = pcall(main)
 restoreMonitor()
 term.setBackgroundColour(colours.black); term.setTextColour(colours.white); term.clear(); term.setCursorPos(1, 1)
-if not ok then printError(err) else print("Vault Brain demo stopped.") end
+if not ok then printError(err) else print("Vault UI demo stopped.") end
