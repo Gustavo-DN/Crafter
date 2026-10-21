@@ -48,3 +48,17 @@ wget https://raw.githubusercontent.com/Gustavo-DN/Crafter/claude/great-johnson-m
 Without a modem (or with nothing heard for 20 s) the board plays a demo. Tap a door for details,
 tap the DEMO/LIVE chip to toggle the demo. Room names, levels and keycard reader mapping are in
 `CONFIG` at the top of `door_board.lua`.
+
+## feeders/ - farm feeders
+
+- `feeders/feeder.lua` - one small computer per farm. It empties the farm barrel (touching the
+  computer) into the vault's input barrel (`minecraft:barrel_73`) over networking cable, and
+  reports its name ("Andesite Farm"), items moved, rate and state on rednet (`vault_feeders`).
+  The first run asks for the name and target and saves `feeder.cfg`; `feeder setup` changes it.
+- `feeders/feeder_list.lua` - list every feeder on the network (terminal or monitor).
+  `P` pauses all feeders, `R` resumes them.
+
+```
+wget https://raw.githubusercontent.com/Gustavo-DN/Crafter/claude/great-johnson-m11jes/feeders/feeder.lua startup.lua
+wget https://raw.githubusercontent.com/Gustavo-DN/Crafter/claude/great-johnson-m11jes/feeders/feeder_list.lua feeder_list.lua
+```
